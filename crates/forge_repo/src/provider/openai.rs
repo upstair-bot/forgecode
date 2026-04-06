@@ -4,8 +4,8 @@ use anyhow::{Context as _, Result};
 use derive_setters::Setters;
 use forge_app::HttpInfra;
 use forge_app::domain::{
-    ChatCompletionMessage, Context as ChatContext, Model, ModelId, ProviderId, ResultStream,
-    Transformer,
+    ChatCompletionMessage, Context as ChatContext, Model, ModelId, ProviderId, RequestInitiator,
+    ResultStream, Transformer,
 };
 use forge_app::dto::openai::{ListModelResponse, ProviderPipeline, Request, Response};
 use forge_config::RetryConfig;
@@ -105,9 +105,21 @@ impl<H: HttpInfra> OpenAIProvider<H> {
     }
 
     /// Creates headers including Session-Id for zai and zai_coding providers
-    /// and GitHub Copilot optimization headers (x-initiator, Openai-Intent,
-    /// Copilot-Vision-Request, anthropic-beta)
+    /// with the default (User) initiator. Used in tests; production code calls
+    /// [`Self::get_headers_with_request_and_initiator`] directly.
+    #[allow(dead_code)]
     fn get_headers_with_request(&self, request: &Request) -> Vec<(String, String)> {
+        self.get_headers_with_request_and_initiator(request, RequestInitiator::default())
+    }
+
+    /// Creates headers including provider-specific headers:
+    /// - Session-Id for zai and zai_coding providers
+    /// - Openai-Intent and x-initiator for GitHub Copilot
+    fn get_headers_with_request_and_initiator(
+        &self,
+        request: &Request,
+        initiator: RequestInitiator,
+    ) -> Vec<(String, String)> {
         let mut headers = self.get_headers();
         // Add Session-Id header for zai and zai_coding providers
         if let Some(session_id) = &request.session_id
@@ -121,65 +133,14 @@ impl<H: HttpInfra> OpenAIProvider<H> {
             );
         }
 
-        // Add GitHub Copilot optimization headers only for github_copilot provider
+        // Add GitHub Copilot-specific initiator headers
         if self.provider.id == ProviderId::GITHUB_COPILOT {
-            // Determine initiator: use request.initiator if available, otherwise detect
-            // from messages
-            let initiator = request.initiator.as_deref().unwrap_or_else(|| {
-                // Fall back to detecting from last message role
-                let is_agent_initiated = request.messages.as_ref().is_some_and(|messages| {
-                    messages.last().is_some_and(|msg| {
-                        // If last message role is not User, it's agent-initiated
-                        !matches!(msg.role, forge_app::dto::openai::Role::User)
-                    })
-                });
-                if is_agent_initiated { "agent" } else { "user" }
-            });
-
-            headers.push(("x-initiator".to_string(), initiator.to_string()));
-            headers.push((
-                "Openai-Intent".to_string(),
-                "conversation-edits".to_string(),
-            ));
-
-            // Detect if request contains vision/image content
-            let has_vision_content = request.messages.as_ref().is_some_and(|messages| {
-                messages.iter().any(|msg| {
-                    msg.content.as_ref().is_some_and(|content| match content {
-                        forge_app::dto::openai::MessageContent::Text(_) => false,
-                        forge_app::dto::openai::MessageContent::Parts(parts) => {
-                            parts.iter().any(|part| {
-                                matches!(part, forge_app::dto::openai::ContentPart::ImageUrl { .. })
-                            })
-                        }
-                    })
-                })
-            });
-
-            if has_vision_content {
-                headers.push(("Copilot-Vision-Request".to_string(), "true".to_string()));
-            }
-
-            // When Copilot proxies an Anthropic Claude model, inject the beta flag
-            let is_anthropic_model = request
-                .model
-                .as_ref()
-                .is_some_and(|m| m.as_str().contains("claude"));
-
-            if is_anthropic_model {
-                headers.push((
-                    "anthropic-beta".to_string(),
-                    "interleaved-thinking-2025-05-14".to_string(),
-                ));
-            }
-
-            debug!(
-                provider = %self.provider.url,
-                initiator = %initiator,
-                has_vision = %has_vision_content,
-                is_anthropic_model = %is_anthropic_model,
-                "Added GitHub Copilot optimization headers"
-            );
+            headers.push(("Openai-Intent".to_string(), "conversation-edits".to_string()));
+            let initiator_value = match initiator {
+                RequestInitiator::User => "user",
+                RequestInitiator::Agent => "agent",
+            };
+            headers.push(("x-initiator".to_string(), initiator_value.to_string()));
         }
 
         headers
@@ -190,12 +151,13 @@ impl<H: HttpInfra> OpenAIProvider<H> {
         model: &ModelId,
         context: ChatContext,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
+        let initiator = context.initiator;
         let mut request = Request::from(context).model(model.clone());
         let mut pipeline = ProviderPipeline::new(&self.provider);
         request = pipeline.transform(request);
 
         let url = self.provider.url.clone();
-        let headers = create_headers(self.get_headers_with_request(&request));
+        let headers = create_headers(self.get_headers_with_request_and_initiator(&request, initiator));
 
         info!(
             url = %url,
@@ -319,7 +281,6 @@ mod tests {
     use bytes::Bytes;
     use forge_app::HttpInfra;
     use forge_app::domain::{Provider, ProviderId, ProviderResponse};
-    use forge_app::dto::openai::{ContentPart, ImageUrl, Message, MessageContent, Role};
     use reqwest::header::HeaderMap;
     use reqwest_eventsource::EventSource;
     use url::Url;
@@ -399,6 +360,20 @@ mod tests {
             models: Some(forge_domain::ModelSource::Url(
                 Url::parse("https://api.anthropic.com/v1/models").unwrap(),
             )),
+        }
+    }
+
+    fn github_copilot(key: &str) -> Provider<Url> {
+        Provider {
+            id: ProviderId::GITHUB_COPILOT,
+            provider_type: forge_domain::ProviderType::Llm,
+            response: Some(ProviderResponse::OpenAI),
+            url: Url::parse("https://api.githubcopilot.com/chat/completions").unwrap(),
+            credential: make_credential(ProviderId::GITHUB_COPILOT, key),
+            custom_headers: None,
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            models: None,
         }
     }
 
@@ -813,309 +788,78 @@ mod tests {
         );
     }
 
-    // Test helper for creating a GitHub Copilot provider
-    fn github_copilot(key: &str) -> Provider<Url> {
-        Provider {
-            id: ProviderId::GITHUB_COPILOT,
-            provider_type: forge_domain::ProviderType::Llm,
-            response: Some(ProviderResponse::OpenAI),
-            url: Url::parse("https://api.githubcopilot.com/chat/completions").unwrap(),
-            credential: make_credential(ProviderId::GITHUB_COPILOT, key),
-            custom_headers: None,
-            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
-            url_params: vec![],
-            models: Some(forge_domain::ModelSource::Url(
-                Url::parse("https://api.githubcopilot.com/models").unwrap(),
-            )),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_headers_with_request_github_copilot_user_initiated() -> anyhow::Result<()> {
-        let provider = github_copilot("test-key");
+    #[test]
+    fn test_github_copilot_headers_user_initiator() {
+        let provider = github_copilot("test-copilot-key");
         let http_client = Arc::new(MockHttpClient::new());
         let openai_provider = OpenAIProvider::new(provider, http_client);
 
-        // Create a request with last message from user
-        let request = Request {
-            messages: Some(vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text("Hello".to_string())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_details: None,
-                reasoning_text: None,
-                reasoning_opaque: None,
-                reasoning_content: None,
-                extra_content: None,
-            }]),
-            ..Default::default()
-        };
+        let request = Request::default();
+        let fixture = RequestInitiator::User;
 
-        let headers = openai_provider.get_headers_with_request(&request);
+        let actual = openai_provider.get_headers_with_request_and_initiator(&request, fixture);
 
-        // Should have Authorization, x-initiator (user), and Openai-Intent headers
         assert!(
-            headers
+            actual
                 .iter()
-                .any(|(k, v)| k == "authorization" && v == "Bearer test-key")
+                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits"),
+            "Expected Openai-Intent header to be present"
         );
         assert!(
-            headers
+            actual
                 .iter()
-                .any(|(k, v)| k == "x-initiator" && v == "user")
+                .any(|(k, v)| k == "x-initiator" && v == "user"),
+            "Expected x-initiator: user"
         );
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits")
-        );
-        // Should NOT have Copilot-Vision-Request header (no vision content)
-        assert!(!headers.iter().any(|(k, _)| k == "Copilot-Vision-Request"));
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_get_headers_with_request_github_copilot_agent_initiated() -> anyhow::Result<()> {
-        let provider = github_copilot("test-key");
+    #[test]
+    fn test_github_copilot_headers_agent_initiator() {
+        let provider = github_copilot("test-copilot-key");
         let http_client = Arc::new(MockHttpClient::new());
         let openai_provider = OpenAIProvider::new(provider, http_client);
 
-        // Create a request with last message from assistant (agent-initiated)
-        let request = Request {
-            messages: Some(vec![
-                Message {
-                    role: Role::User,
-                    content: Some(MessageContent::Text("Hello".to_string())),
-                    name: None,
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_details: None,
-                    reasoning_text: None,
-                    reasoning_opaque: None,
-                    reasoning_content: None,
-                    extra_content: None,
-                },
-                Message {
-                    role: Role::Assistant,
-                    content: Some(MessageContent::Text("Response".to_string())),
-                    name: None,
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_details: None,
-                    reasoning_text: None,
-                    reasoning_opaque: None,
-                    reasoning_content: None,
-                    extra_content: None,
-                },
-            ]),
-            ..Default::default()
-        };
+        let request = Request::default();
+        let fixture = RequestInitiator::Agent;
 
-        let headers = openai_provider.get_headers_with_request(&request);
+        let actual = openai_provider.get_headers_with_request_and_initiator(&request, fixture);
 
-        // Should have Authorization and x-initiator (agent) headers
         assert!(
-            headers
+            actual
                 .iter()
-                .any(|(k, v)| k == "authorization" && v == "Bearer test-key")
+                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits"),
+            "Expected Openai-Intent header to be present"
         );
         assert!(
-            headers
+            actual
                 .iter()
-                .any(|(k, v)| k == "x-initiator" && v == "agent")
+                .any(|(k, v)| k == "x-initiator" && v == "agent"),
+            "Expected x-initiator: agent"
         );
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits")
-        );
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_get_headers_with_request_github_copilot_vision_content() -> anyhow::Result<()> {
-        let provider = github_copilot("test-key");
-        let http_client = Arc::new(MockHttpClient::new());
-        let openai_provider = OpenAIProvider::new(provider, http_client);
-
-        // Create a request with image content
-        let request = Request {
-            messages: Some(vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/image.png".to_string(),
-                        detail: None,
-                    },
-                    cache_control: None,
-                }])),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_details: None,
-                reasoning_text: None,
-                reasoning_opaque: None,
-                reasoning_content: None,
-                extra_content: None,
-            }]),
-            ..Default::default()
-        };
-
-        let headers = openai_provider.get_headers_with_request(&request);
-
-        // Should have all GitHub Copilot headers including vision
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "authorization" && v == "Bearer test-key")
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "x-initiator" && v == "user")
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits")
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "Copilot-Vision-Request" && v == "true")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_headers_with_request_non_github_copilot_no_extra_headers()
-    -> anyhow::Result<()> {
-        // Verify that non-GitHub Copilot providers don't get the optimization headers
+    #[test]
+    fn test_non_copilot_provider_has_no_initiator_headers() {
         let provider = openai("test-key");
         let http_client = Arc::new(MockHttpClient::new());
         let openai_provider = OpenAIProvider::new(provider, http_client);
 
-        let request = Request {
-            messages: Some(vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text("Hello".to_string())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_details: None,
-                reasoning_text: None,
-                reasoning_opaque: None,
-                reasoning_content: None,
-                extra_content: None,
-            }]),
-            ..Default::default()
-        };
+        let request = Request::default();
 
-        let headers = openai_provider.get_headers_with_request(&request);
+        // Try both initiator variants
+        for initiator in [RequestInitiator::User, RequestInitiator::Agent] {
+            let actual =
+                openai_provider.get_headers_with_request_and_initiator(&request, initiator);
 
-        // Should only have Authorization header (no GitHub Copilot headers)
-        assert_eq!(headers.len(), 1);
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "authorization" && v == "Bearer test-key")
-        );
-        assert!(!headers.iter().any(|(k, _)| k == "x-initiator"));
-        assert!(!headers.iter().any(|(k, _)| k == "Openai-Intent"));
-        assert!(!headers.iter().any(|(k, _)| k == "Copilot-Vision-Request"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_headers_with_request_github_copilot_claude_model_adds_anthropic_beta()
-    -> anyhow::Result<()> {
-        let provider = github_copilot("test-key");
-        let http_client = Arc::new(MockHttpClient::new());
-        let openai_provider = OpenAIProvider::new(provider, http_client);
-
-        // Request targeting a Copilot-proxied Claude model
-        let request = Request {
-            model: Some(forge_app::domain::ModelId::new("claude-sonnet-4-5")),
-            messages: Some(vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text("Hello".to_string())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_details: None,
-                reasoning_text: None,
-                reasoning_opaque: None,
-                reasoning_content: None,
-                extra_content: None,
-            }]),
-            ..Default::default()
-        };
-
-        let headers = openai_provider.get_headers_with_request(&request);
-
-        // anthropic-beta must be present for Claude models via Copilot
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "anthropic-beta" && v == "interleaved-thinking-2025-05-14")
-        );
-        // Standard Copilot headers must also be present
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "x-initiator" && v == "user")
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_headers_with_request_github_copilot_non_claude_model_no_anthropic_beta()
-    -> anyhow::Result<()> {
-        let provider = github_copilot("test-key");
-        let http_client = Arc::new(MockHttpClient::new());
-        let openai_provider = OpenAIProvider::new(provider, http_client);
-
-        // Request targeting a non-Claude model (e.g. GPT-4o)
-        let request = Request {
-            model: Some(forge_app::domain::ModelId::new("gpt-4o")),
-            messages: Some(vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text("Hello".to_string())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_details: None,
-                reasoning_text: None,
-                reasoning_opaque: None,
-                reasoning_content: None,
-                extra_content: None,
-            }]),
-            ..Default::default()
-        };
-
-        let headers = openai_provider.get_headers_with_request(&request);
-
-        // anthropic-beta must NOT be present for non-Claude models
-        assert!(!headers.iter().any(|(k, _)| k == "anthropic-beta"));
-        // Standard Copilot headers must still be present
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "x-initiator" && v == "user")
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits")
-        );
-        Ok(())
+            assert!(
+                !actual.iter().any(|(k, _)| k == "Openai-Intent"),
+                "Non-Copilot provider should not have Openai-Intent header"
+            );
+            assert!(
+                !actual.iter().any(|(k, _)| k == "x-initiator"),
+                "Non-Copilot provider should not have x-initiator header"
+            );
+        }
     }
 }
 

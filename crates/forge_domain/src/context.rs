@@ -22,6 +22,24 @@ use crate::{
     ReasoningFull, ToolChoice, ToolDefinition, ToolOutput, ToolValue, Usage,
 };
 
+/// Identifies who initiated an LLM request, used by provider layers to classify
+/// Copilot premium requests correctly.
+///
+/// Only the first top-level user-driven request in a conversation should be
+/// classified as [`RequestInitiator::User`]. All internally-generated requests
+/// (sub-agent calls, title generation, tool orchestration, etc.) must be
+/// classified as [`RequestInitiator::Agent`] so that Copilot counts them as
+/// agent-initiated and avoids incorrect premium-request amplification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RequestInitiator {
+    /// The request was triggered directly by a human user interaction.
+    #[default]
+    User,
+    /// The request was triggered internally (sub-agent, title generator, or
+    /// any other automated orchestration path).
+    Agent,
+}
+
 /// Response format for structured output
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -402,10 +420,6 @@ impl std::ops::DerefMut for MessageEntry {
 pub struct Context {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ConversationId>,
-    /// Indicates who initiated the conversation: "user" or "agent".
-    /// Used for GitHub Copilot billing optimization.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initiator: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<MessageEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -431,6 +445,11 @@ pub struct Context {
     /// Response format for structured output (JSON schema)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+    /// Runtime-only metadata identifying who initiated this request.
+    /// Not serialized or persisted; used by provider layers for Copilot
+    /// initiator classification.
+    #[serde(skip)]
+    pub initiator: RequestInitiator,
 }
 
 impl Context {
@@ -807,7 +826,7 @@ mod tests {
 
     use super::*;
     use crate::transformer::Transformer;
-    use crate::{DirectoryEntry, FileInfo, estimate_token_count};
+    use crate::{estimate_token_count, DirectoryEntry, FileInfo};
 
     #[test]
     fn test_override_system_message() {
@@ -1712,5 +1731,48 @@ mod tests {
         // No duplicate null-signature entry should have been appended.
         let expected = fixture_details;
         assert_eq!(stored, &expected);
+    }
+
+    // ── RequestInitiator & Context.initiator ─────────────────────────────────
+
+    #[test]
+    fn test_request_initiator_default_is_user() {
+        let actual = RequestInitiator::default();
+        let expected = RequestInitiator::User;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_context_default_initiator_is_user() {
+        let fixture = Context::default();
+        let actual = fixture.initiator;
+        let expected = RequestInitiator::User;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_context_initiator_can_be_set_to_agent() {
+        let fixture = Context::default().initiator(RequestInitiator::Agent);
+        let actual = fixture.initiator;
+        let expected = RequestInitiator::Agent;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_context_initiator_is_not_serialized() {
+        let fixture = Context::default().initiator(RequestInitiator::Agent);
+        let json = serde_json::to_value(&fixture).unwrap();
+        // The `initiator` field must not appear in the serialized output.
+        let actual = json.get("initiator");
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn test_context_initiator_defaults_to_user_on_deserialize() {
+        // Serialize a plain context (initiator skipped) and deserialize it back.
+        let fixture = Context::default();
+        let json = serde_json::to_string(&fixture).unwrap();
+        let actual: Context = serde_json::from_str(&json).unwrap();
+        assert_eq!(actual.initiator, RequestInitiator::User);
     }
 }
