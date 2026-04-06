@@ -3,15 +3,15 @@
 use std::io::{self, Write};
 
 use streamdown_parser::ParseEvent;
-use streamdown_render::text::text_wrap;
 
 use crate::code::CodeHighlighter;
 use crate::heading::render_heading;
 use crate::inline::{render_inline_content, render_inline_elements};
-use crate::list::{ListState, render_list_item};
+use crate::list::{render_list_item, ListState};
 use crate::style::InlineStyler;
 use crate::table::render_table;
 use crate::theme::Theme;
+use crate::wrap::wrap_with_prefixes;
 
 /// Main renderer for markdown events.
 pub struct Renderer<W: Write> {
@@ -257,11 +257,11 @@ impl<W: Write> Renderer<W> {
                 let width = self.current_width();
                 // Parse inline formatting (bold, italic, etc.) in blockquote content
                 let rendered_content = render_inline_content(text, &self.theme);
-                let wrapped = text_wrap(&rendered_content, width, 0, &margin, &margin, false, true);
+                let wrapped = wrap_with_prefixes(&rendered_content, width, &margin, &margin);
                 if wrapped.is_empty() {
                     self.writeln(&margin)?;
                 } else {
-                    for line in wrapped.lines {
+                    for line in wrapped {
                         self.writeln(&line)?;
                     }
                 }
@@ -304,5 +304,76 @@ impl<W: Write> Renderer<W> {
         }
 
         self.writer.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use streamdown_parser::ParseEvent;
+
+    /// Render a sequence of events with default dark theme and return the raw
+    /// output string.
+    fn render_events(events: &[ParseEvent], width: usize) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut r = Renderer::new(&mut buf, width);
+        for ev in events {
+            r.render_event(ev).unwrap();
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Strip ANSI escape codes for plain-text comparison.
+    fn strip(s: &str) -> String {
+        String::from_utf8(strip_ansi_escapes::strip(s)).unwrap()
+    }
+
+    // ── Korean / Hangul spacing in blockquotes ─────────────────────────────
+    // These tests would fail with the old text_wrap path that dropped spaces
+    // adjacent to Hangul characters.
+
+    #[test]
+    fn blockquote_korean_space_preserved_no_wrap() {
+        let setup = vec![
+            ParseEvent::BlockquoteStart { depth: 1 },
+            ParseEvent::BlockquoteLine("안녕 하세요".to_string()),
+            ParseEvent::BlockquoteEnd,
+        ];
+        let actual = strip(&render_events(&setup, 80));
+        // The space between 안녕 and 하세요 must appear verbatim.
+        assert!(
+            actual.contains("안녕 하세요"),
+            "space between Korean words must be preserved: {actual:?}"
+        );
+    }
+
+    #[test]
+    fn blockquote_korean_space_preserved_after_wrap() {
+        // Narrow width forces wrapping inside the blockquote.
+        let setup = vec![
+            ParseEvent::BlockquoteStart { depth: 1 },
+            ParseEvent::BlockquoteLine("안녕 하세요 한국어".to_string()),
+            ParseEvent::BlockquoteEnd,
+        ];
+        let actual = strip(&render_events(&setup, 80));
+        // All spaces must survive regardless of wrapping decisions.
+        assert!(
+            actual.contains("안녕 하세요 한국어"),
+            "all Korean spaces must be preserved: {actual:?}"
+        );
+    }
+
+    #[test]
+    fn blockquote_multi_korean_words_all_spaces_preserved() {
+        let setup = vec![
+            ParseEvent::BlockquoteStart { depth: 1 },
+            ParseEvent::BlockquoteLine("이것은 한국어 테스트 문장입니다".to_string()),
+            ParseEvent::BlockquoteEnd,
+        ];
+        let actual = strip(&render_events(&setup, 80));
+        assert!(
+            actual.contains("이것은 한국어 테스트 문장입니다"),
+            "all spaces must be preserved: {actual:?}"
+        );
     }
 }
