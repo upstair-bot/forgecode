@@ -24,7 +24,7 @@ lazy_static! {
 ///
 /// # Example
 ///
-/// ```
+/// ```text
 /// // Before transformation:
 /// tool_use.tool_use_id = "functions.shell:0"
 ///
@@ -95,8 +95,8 @@ impl Transformer for SanitizeToolIds {
 mod tests {
     use aws_sdk_bedrockruntime::types::ContentBlock;
     use forge_domain::{
-        Context, ContextMessage, Role, TextMessage, ToolCallArguments, ToolCallFull, ToolCallId,
-        ToolName, ToolResult,
+        Context, ContextMessage, RequestInitiator, Role, TextMessage, ToolCallArguments,
+        ToolCallFull, ToolCallId, ToolName, ToolResult,
     };
 
     use super::*;
@@ -107,18 +107,14 @@ mod tests {
         // This is the exact error case from the issue: "functions.shell:0"
         let context = Context {
             conversation_id: None,
-            messages: vec![
-                ContextMessage::Text(
-                    TextMessage::new(Role::Assistant, "test")
-                        .tool_calls(vec![
-                            ToolCallFull::new(ToolName::new("shell"))
-                                .call_id("functions.shell:0")
-                                .arguments(ToolCallArguments::from_json("{}")),
-                        ])
-                        .model(forge_domain::ModelId::new("test")),
-                )
-                .into(),
-            ],
+            messages: vec![ContextMessage::Text(
+                TextMessage::new(Role::Assistant, "test")
+                    .tool_calls(vec![ToolCallFull::new(ToolName::new("shell"))
+                        .call_id("functions.shell:0")
+                        .arguments(ToolCallArguments::from_json("{}"))])
+                    .model(forge_domain::ModelId::new("test")),
+            )
+            .into()],
             tools: vec![],
             tool_choice: None,
             max_tokens: None,
@@ -128,7 +124,7 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
+            initiator: RequestInitiator::default(),
         };
 
         let request = ConverseStreamInput::from_domain(context).expect("Failed to convert context");
@@ -155,14 +151,12 @@ mod tests {
     fn test_sanitizes_tool_result_id_with_invalid_chars() {
         let context = Context {
             conversation_id: None,
-            messages: vec![
-                ContextMessage::tool_result(
-                    ToolResult::new(ToolName::new("test_tool"))
-                        .call_id(ToolCallId::new("toolu_01!@#$ABC123"))
-                        .success("result"),
-                )
-                .into(),
-            ],
+            messages: vec![ContextMessage::tool_result(
+                ToolResult::new(ToolName::new("test_tool"))
+                    .call_id(ToolCallId::new("toolu_01!@#$ABC123"))
+                    .success("result"),
+            )
+            .into()],
             tools: vec![],
             tool_choice: None,
             max_tokens: None,
@@ -172,7 +166,7 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
+            initiator: RequestInitiator::default(),
         };
 
         let request = ConverseStreamInput::from_domain(context).expect("Failed to convert context");
@@ -201,18 +195,14 @@ mod tests {
         let valid_id = "call_abc-123_XYZ";
         let context = Context {
             conversation_id: None,
-            messages: vec![
-                ContextMessage::Text(
-                    TextMessage::new(Role::Assistant, "test")
-                        .tool_calls(vec![
-                            ToolCallFull::new(ToolName::new("test_tool"))
-                                .call_id(valid_id)
-                                .arguments(ToolCallArguments::from_json("{}")),
-                        ])
-                        .model(forge_domain::ModelId::new("test")),
-                )
-                .into(),
-            ],
+            messages: vec![ContextMessage::Text(
+                TextMessage::new(Role::Assistant, "test")
+                    .tool_calls(vec![ToolCallFull::new(ToolName::new("test_tool"))
+                        .call_id(valid_id)
+                        .arguments(ToolCallArguments::from_json("{}"))])
+                    .model(forge_domain::ModelId::new("test")),
+            )
+            .into()],
             tools: vec![],
             tool_choice: None,
             max_tokens: None,
@@ -222,7 +212,7 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
+            initiator: RequestInitiator::default(),
         };
 
         let request = ConverseStreamInput::from_domain(context).expect("Failed to convert context");
@@ -259,7 +249,7 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
+            initiator: RequestInitiator::default(),
         };
 
         let request = ConverseStreamInput::from_domain(context).expect("Failed to convert context");
