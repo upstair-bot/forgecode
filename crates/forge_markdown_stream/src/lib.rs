@@ -33,6 +33,7 @@ mod style;
 mod table;
 mod theme;
 mod utils;
+mod wrap;
 
 use std::io::{self, Write};
 

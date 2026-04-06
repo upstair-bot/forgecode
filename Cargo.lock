@@ -2214,6 +2214,7 @@ version = "0.1.0"
 dependencies = [
  "colored",
  "insta",
+ "pretty_assertions",
  "streamdown-ansi",
  "streamdown-core",
  "streamdown-parser",

@@ -271,7 +271,7 @@ impl Theme {
     /// Detects the terminal theme (dark or light) and returns the appropriate
     /// theme.
     pub fn detect() -> Self {
-        use crate::utils::{ThemeMode, detect_theme_mode};
+        use crate::utils::{detect_theme_mode, ThemeMode};
 
         match detect_theme_mode() {
             ThemeMode::Light => Self::light(),
