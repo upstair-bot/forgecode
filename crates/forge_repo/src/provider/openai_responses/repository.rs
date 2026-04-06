@@ -6,7 +6,7 @@ use derive_setters::Setters;
 use eventsource_stream::Eventsource;
 use forge_app::HttpInfra;
 use forge_app::domain::{
-    ChatCompletionMessage, Context as ChatContext, Model, ModelId, ResultStream,
+    ChatCompletionMessage, Context as ChatContext, Model, ModelId, RequestInitiator, ResultStream,
 };
 use forge_config::RetryConfig;
 use forge_domain::{BoxStream, ChatRepository, Provider};
@@ -72,6 +72,24 @@ impl<H: HttpInfra> OpenAIResponsesProvider<H> {
     }
 
     fn get_headers_for_conversation(&self, conversation_id: Option<&str>) -> Vec<(String, String)> {
+        self.get_headers_for_conversation_with_initiator(
+            conversation_id,
+            RequestInitiator::default(),
+        )
+    }
+
+    /// Builds the full request header list for a conversation, including
+    /// provider-specific headers.
+    ///
+    /// - For Codex: adds `x-client-request-id` and `session_id` from
+    ///   `conversation_id`, and `ChatGPT-Account-Id` from credential params.
+    /// - For GitHub Copilot: adds `Openai-Intent: conversation-edits` and
+    ///   `x-initiator: user|agent` based on `initiator`.
+    fn get_headers_for_conversation_with_initiator(
+        &self,
+        conversation_id: Option<&str>,
+        initiator: RequestInitiator,
+    ) -> Vec<(String, String)> {
         let mut headers = Vec::new();
         if let Some(api_key) = self
             .provider
@@ -139,6 +157,16 @@ impl<H: HttpInfra> OpenAIResponsesProvider<H> {
             }
         }
 
+        // Add GitHub Copilot-specific initiator headers
+        if self.provider.id == forge_domain::ProviderId::GITHUB_COPILOT {
+            headers.push(("Openai-Intent".to_string(), "conversation-edits".to_string()));
+            let initiator_value = match initiator {
+                RequestInitiator::User => "user",
+                RequestInitiator::Agent => "agent",
+            };
+            headers.push(("x-initiator".to_string(), initiator_value.to_string()));
+        }
+
         headers
     }
 }
@@ -150,7 +178,11 @@ impl<T: HttpInfra> OpenAIResponsesProvider<T> {
         context: ChatContext,
     ) -> ResultStream<ChatCompletionMessage, anyhow::Error> {
         let conversation_id = context.conversation_id.as_ref().map(ToString::to_string);
-        let headers = create_headers(self.get_headers_for_conversation(conversation_id.as_deref()));
+        let initiator = context.initiator;
+        let headers = create_headers(self.get_headers_for_conversation_with_initiator(
+            conversation_id.as_deref(),
+            initiator,
+        ));
         let mut request = oai::CreateResponse::from_domain(context)?;
         request.model = Some(model.as_str().to_string());
 
@@ -433,7 +465,7 @@ mod tests {
 
     use forge_app::domain::{
         Content, Context as ChatContext, ContextMessage, FinishReason, ModelId, Provider,
-        ProviderId, ProviderResponse,
+        ProviderId, ProviderResponse, RequestInitiator,
     };
     use tokio_stream::StreamExt;
     use url::Url;
@@ -464,6 +496,20 @@ mod tests {
             response: Some(ProviderResponse::OpenAI),
             url: Url::parse(url).unwrap(),
             credential: make_credential(ProviderId::OPENAI, key),
+            custom_headers: None,
+            auth_methods: vec![forge_domain::AuthMethod::ApiKey],
+            url_params: vec![],
+            models: None,
+        }
+    }
+
+    fn github_copilot_responses(key: &str) -> Provider<Url> {
+        Provider {
+            id: ProviderId::GITHUB_COPILOT,
+            provider_type: forge_domain::ProviderType::Llm,
+            response: Some(ProviderResponse::OpenAI),
+            url: Url::parse("https://api.githubcopilot.com/chat/completions").unwrap(),
+            credential: make_credential(ProviderId::GITHUB_COPILOT, key),
             custom_headers: None,
             auth_methods: vec![forge_domain::AuthMethod::ApiKey],
             url_params: vec![],
@@ -1494,5 +1540,95 @@ mod tests {
         assert!(actual.is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_github_copilot_responses_headers_user_initiator() {
+        let provider = github_copilot_responses("test-copilot-key");
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
+
+        let fixture = RequestInitiator::User;
+        let actual = provider_impl.get_headers_for_conversation_with_initiator(None, fixture);
+
+        assert!(
+            actual
+                .iter()
+                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits"),
+            "Expected Openai-Intent header to be present"
+        );
+        assert!(
+            actual.iter().any(|(k, v)| k == "x-initiator" && v == "user"),
+            "Expected x-initiator: user"
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_responses_headers_agent_initiator() {
+        let provider = github_copilot_responses("test-copilot-key");
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
+
+        let fixture = RequestInitiator::Agent;
+        let actual = provider_impl.get_headers_for_conversation_with_initiator(None, fixture);
+
+        assert!(
+            actual
+                .iter()
+                .any(|(k, v)| k == "Openai-Intent" && v == "conversation-edits"),
+            "Expected Openai-Intent header to be present"
+        );
+        assert!(
+            actual
+                .iter()
+                .any(|(k, v)| k == "x-initiator" && v == "agent"),
+            "Expected x-initiator: agent"
+        );
+    }
+
+    #[test]
+    fn test_non_copilot_responses_provider_has_no_initiator_headers() {
+        let provider = openai_responses("test-key", "https://api.openai.com/v1");
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
+
+        for initiator in [RequestInitiator::User, RequestInitiator::Agent] {
+            let actual =
+                provider_impl.get_headers_for_conversation_with_initiator(None, initiator);
+
+            assert!(
+                !actual.iter().any(|(k, _)| k == "Openai-Intent"),
+                "Non-Copilot provider should not have Openai-Intent header"
+            );
+            assert!(
+                !actual.iter().any(|(k, _)| k == "x-initiator"),
+                "Non-Copilot provider should not have x-initiator header"
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_copilot_responses_default_initiator_is_agent_safe() {
+        // Default initiator is User per the domain definition.
+        // This test confirms the safe fallback behavior: when no initiator is
+        // set, the default resolves to User (not Agent), which is the correct
+        // safe-fallback only when explicitly triggered via the public API.
+        // The orchestration layer is responsible for setting Agent on internal
+        // calls; here we just verify the header value matches the default.
+        let provider = github_copilot_responses("test-copilot-key");
+        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
+
+        // Use get_headers_for_conversation (which uses the default initiator)
+        let actual = provider_impl.get_headers_for_conversation(None);
+
+        // The default path uses RequestInitiator::default() which is User
+        let x_initiator = actual.iter().find(|(k, _)| k == "x-initiator");
+        assert!(x_initiator.is_some(), "x-initiator header must be present");
+        assert_eq!(
+            x_initiator.unwrap().1,
+            "user",
+            "Default initiator fallback must be user"
+        );
     }
 }

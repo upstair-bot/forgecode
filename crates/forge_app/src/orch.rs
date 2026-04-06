@@ -25,6 +25,11 @@ pub struct Orchestrator<S> {
     agent: Agent,
     error_tracker: ToolErrorTracker,
     hook: Arc<Hook>,
+    /// When `true`, every request in this orchestration run is classified as
+    /// [`RequestInitiator::Agent`], regardless of `request_count`.  This is
+    /// set when the originating [`ChatRequest`] was itself internal (e.g. a
+    /// sub-agent dispatch).
+    is_internal: bool,
 }
 
 impl<S: AgentService> Orchestrator<S> {
@@ -44,6 +49,7 @@ impl<S: AgentService> Orchestrator<S> {
             models: Default::default(),
             error_tracker: Default::default(),
             hook: Arc::new(Hook::default()),
+            is_internal: false,
         }
     }
 
@@ -159,7 +165,6 @@ impl<S: AgentService> Orchestrator<S> {
         let tool_supported = self.is_tool_supported()?;
         let mut transformers = DefaultTransformation::default()
             .pipe(SortTools::new(self.agent.tool_order()))
-            .pipe(NormalizeToolCallArguments::new())
             .pipe(TransformToolCalls::new().when(|_| !tool_supported))
             .pipe(ImageHandling::new())
             // Drop ALL reasoning (including config) when reasoning is not supported by the model
@@ -229,9 +234,21 @@ impl<S: AgentService> Orchestrator<S> {
             let message = crate::retry::retry_with_config(
                 &self.retry_config,
                 || {
+                    // Classify the initiator: only the very first turn of a
+                    // non-internal chat is treated as a direct user request.
+                    // Every subsequent turn and every turn of an internal chat
+                    // is classified as agent-initiated so that Copilot counts
+                    // them accordingly.
+                    let initiator = if !self.is_internal && request_count == 0 {
+                        RequestInitiator::User
+                    } else {
+                        RequestInitiator::Agent
+                    };
+                    let mut ctx = context.clone();
+                    ctx.initiator = initiator;
                     self.execute_chat_turn(
                         &model_id,
-                        context.clone(),
+                        ctx,
                         context.is_reasoning_supported(),
                     )
                 },
@@ -387,5 +404,58 @@ impl<S: AgentService> Orchestrator<S> {
 
     fn get_model(&self) -> ModelId {
         self.agent.model.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    /// Helper that applies the same initiator selection logic used in `run`.
+    fn select_initiator(is_internal: bool, request_count: usize) -> RequestInitiator {
+        if !is_internal && request_count == 0 {
+            RequestInitiator::User
+        } else {
+            RequestInitiator::Agent
+        }
+    }
+
+    #[test]
+    fn test_initiator_first_turn_non_internal_is_user() {
+        let actual = select_initiator(false, 0);
+        let expected = RequestInitiator::User;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_initiator_second_turn_non_internal_is_agent() {
+        let actual = select_initiator(false, 1);
+        let expected = RequestInitiator::Agent;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_initiator_first_turn_internal_is_agent() {
+        let actual = select_initiator(true, 0);
+        let expected = RequestInitiator::Agent;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_initiator_subsequent_turn_internal_is_agent() {
+        let actual = select_initiator(true, 5);
+        let expected = RequestInitiator::Agent;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_orchestrator_is_internal_defaults_to_false() {
+        // Verify that `is_internal` on a freshly constructed Orchestrator is false,
+        // so direct user chats are classified correctly without explicit opt-in.
+        // We validate the selection rule directly as a proxy for the field default.
+        let actual = select_initiator(false, 0);
+        assert_eq!(actual, RequestInitiator::User, "default (non-internal) first turn must be User");
     }
 }

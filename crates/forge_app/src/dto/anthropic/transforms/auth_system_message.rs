@@ -90,7 +90,7 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
+            initiator: Default::default(),
         };
 
         Request::try_from(context).unwrap()

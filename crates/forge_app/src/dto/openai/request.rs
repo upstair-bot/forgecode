@@ -359,7 +359,11 @@ impl From<Context> for Request {
                     .into_iter()
                     .map(Tool::from)
                     .collect::<Vec<_>>();
-                if tools.is_empty() { None } else { Some(tools) }
+                if tools.is_empty() {
+                    None
+                } else {
+                    Some(tools)
+                }
             },
             model: None,
             prompt: Default::default(),
@@ -404,7 +408,7 @@ impl From<Context> for Request {
                                               * on model capabilities */
             stream_options: Some(StreamOptions { include_usage: Some(true) }),
             session_id: context.conversation_id.map(|id| id.to_string()),
-            initiator: context.initiator,
+            initiator: None, // initiator is read from context.initiator (RequestInitiator) by the provider layer
             reasoning: context.reasoning,
             reasoning_effort: Default::default(),
             max_completion_tokens: Default::default(),

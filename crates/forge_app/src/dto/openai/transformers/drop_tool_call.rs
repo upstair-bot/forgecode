@@ -71,7 +71,7 @@ mod tests {
             reasoning: None,
             stream: None,
             response_format: None,
-            initiator: None,
+            initiator: Default::default(),
         };
 
         let request = Request::from(context);

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use derive_setters::Setters;
 use forge_domain::{
     ChatCompletionMessageFull, Context, ContextMessage, ConversationId, ModelId, ProviderId,
-    ReasoningConfig, ResponseFormat, ResultStreamExt, UserPrompt,
+    ReasoningConfig, RequestInitiator, ResponseFormat, ResultStreamExt, UserPrompt,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -68,6 +68,9 @@ impl<S: AS> TitleGenerator<S> {
             .add_message(ContextMessage::system(template))
             .add_message(ContextMessage::user(prompt, Some(self.model_id.clone())))
             .response_format(ResponseFormat::JsonSchema(Box::new(schema)));
+
+        // Title generation is always an internal/agent-initiated request.
+        ctx.initiator = RequestInitiator::Agent;
 
         // Set the reasoning if configured.
         if let Some(reasoning) = self.reasoning.as_ref() {
