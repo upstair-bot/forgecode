@@ -2,10 +2,10 @@
 
 use streamdown_ansi::utils::visible_length;
 use streamdown_parser::ListBullet;
-use streamdown_render::text::text_wrap;
 
 use crate::inline::render_inline_content;
 use crate::style::{InlineStyler, ListStyler};
+use crate::wrap::wrap_with_prefixes;
 
 /// Bullet characters for dash lists at different nesting levels.
 const BULLETS_DASH: [&str; 4] = ["•", "◦", "▪", "‣"];
@@ -183,20 +183,12 @@ pub fn render_list_item<S: InlineStyler + ListStyler>(
     let next_prefix = format!("{}{}", margin, " ".repeat(content_indent));
 
     // Wrap the content
-    let wrapped = text_wrap(
-        &rendered_content,
-        width,
-        0,
-        &first_prefix,
-        &next_prefix,
-        false,
-        true,
-    );
+    let wrapped = wrap_with_prefixes(&rendered_content, width, &first_prefix, &next_prefix);
 
     if wrapped.is_empty() {
         vec![first_prefix]
     } else {
-        wrapped.lines
+        wrapped
     }
 }
 
@@ -332,8 +324,8 @@ mod tests {
             "This is a very long list item that should wrap to multiple lines",
             40,
         );
-        insta::assert_snapshot!(result, @r"
-        <dash>•</dash> This is a very long list item that
+        insta::assert_snapshot!(result, @"
+        <dash>•</dash> This is a very long list item that 
           should wrap to multiple lines
         ");
     }
@@ -517,6 +509,83 @@ mod tests {
                     @"  <dash>•</dash> map[ ] access"
                 );
             }
+        }
+    }
+
+    // ── Korean / Hangul spacing regression tests ───────────────────────────
+    // These tests verify that spaces between Korean words are NOT dropped when
+    // list items are wrapped.  They would fail with the old text_wrap path.
+    //
+    // Width convention (matching text_wrap): `width` is the maximum CONTENT
+    // columns per line; the bullet prefix is prepended but does NOT count
+    // against this budget.
+    mod korean {
+        use super::*;
+
+        #[test]
+        fn space_preserved_single_line() {
+            // width=80 content cols; "안녕 하세요" (11 cols) → no wrap.
+            // The space between 안녕 and 하세요 must appear in the output.
+            let setup = "안녕 하세요";
+            let actual = render(0, ListBullet::Dash, setup);
+            assert!(
+                actual.contains("안녕 하세요"),
+                "space between Korean words must be preserved: {actual:?}"
+            );
+        }
+
+        #[test]
+        fn space_preserved_after_wrap() {
+            // width=8 content cols forces a line break.
+            // "안녕" = 4 cols + space = 5; "하세요" = 6 cols; 5+6=11 > 8 → wrap.
+            let setup = "안녕 하세요";
+            let actual_lines = render_list_item(
+                0,
+                &ListBullet::Dash,
+                setup,
+                8, // content-only width
+                "  ",
+                &TagStyler,
+                &mut ListState::default(),
+            );
+            assert_eq!(
+                actual_lines.len(),
+                2,
+                "expected wrap into 2 lines: {actual_lines:?}"
+            );
+            // First line must contain "안녕 " WITH the trailing space.
+            assert!(
+                actual_lines[0].contains("안녕 "),
+                "space after 안녕 must be preserved in first line: {:?}",
+                actual_lines[0]
+            );
+            // Second line must contain 하세요 (no lost content).
+            assert!(
+                actual_lines[1].contains("하세요"),
+                "second line must contain 하세요: {:?}",
+                actual_lines[1]
+            );
+        }
+
+        #[test]
+        fn multi_space_all_preserved() {
+            // width=80; multiple spaces in a Korean sentence — all must appear.
+            let setup = "이것은 한국어 테스트 입니다";
+            let actual = render(0, ListBullet::Dash, setup);
+            assert!(
+                actual.contains("이것은 한국어 테스트 입니다"),
+                "spaces missing in output: {actual:?}"
+            );
+        }
+
+        #[test]
+        fn ordered_list_space_preserved() {
+            let setup = "안녕 하세요";
+            let actual = render(0, ListBullet::Ordered(1), setup);
+            assert!(
+                actual.contains("안녕 하세요"),
+                "space missing in ordered list item: {actual:?}"
+            );
         }
     }
 }
