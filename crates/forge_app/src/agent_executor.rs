@@ -53,11 +53,7 @@ impl<S: Services> AgentExecutor<S> {
         .await?;
 
         // Create a new conversation for agent execution
-        // Create context with agent initiator since it's spawned by a parent agent
-        let context = forge_domain::Context::default().initiator("agent".to_string());
-        let conversation = Conversation::generate()
-            .title(task.clone())
-            .context(context.clone());
+        let conversation = Conversation::generate().title(task.clone());
         self.services
             .conversation_service()
             .upsert_conversation(conversation.clone())
@@ -67,7 +63,7 @@ impl<S: Services> AgentExecutor<S> {
         let mut response_stream = app
             .chat(
                 agent_id.clone(),
-                ChatRequest::new(Event::new(task.clone()), conversation.id),
+                ChatRequest::new(Event::new(task.clone()), conversation.id).internal(true),
             )
             .await?;
 
