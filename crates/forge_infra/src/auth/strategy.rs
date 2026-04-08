@@ -241,7 +241,21 @@ impl AuthStrategy for OAuthDeviceStrategy {
 
         let device_auth_response: oauth2::StandardDeviceAuthorizationResponse =
             request.request_async(&http_fn).await.map_err(|e| {
-                AuthError::InitiationFailed(format!("Device authorization request failed: {e}"))
+                // Unpack the inner reqwest error for actionable diagnostics; the default
+                // Display for RequestTokenError::Request is the opaque "Request failed".
+                let detail = match &e {
+                    oauth2::RequestTokenError::Request(req_err) => format!("{req_err}"),
+                    oauth2::RequestTokenError::Parse(parse_err, body) => {
+                        format!(
+                            "response parse error ({parse_err}); body: {}",
+                            String::from_utf8_lossy(body)
+                        )
+                    }
+                    _ => e.to_string(),
+                };
+                AuthError::InitiationFailed(format!(
+                    "Device authorization request failed: {detail}"
+                ))
             })?;
 
         // Build the type-safe context
@@ -344,7 +358,21 @@ impl AuthStrategy for OAuthWithApiKeyStrategy {
 
         let device_auth_response: oauth2::StandardDeviceAuthorizationResponse =
             request.request_async(&http_fn).await.map_err(|e| {
-                AuthError::InitiationFailed(format!("Device authorization request failed: {e}"))
+                // Unpack the inner reqwest error for actionable diagnostics; the default
+                // Display for RequestTokenError::Request is the opaque "Request failed".
+                let detail = match &e {
+                    oauth2::RequestTokenError::Request(req_err) => format!("{req_err}"),
+                    oauth2::RequestTokenError::Parse(parse_err, body) => {
+                        format!(
+                            "response parse error ({parse_err}); body: {}",
+                            String::from_utf8_lossy(body)
+                        )
+                    }
+                    _ => e.to_string(),
+                };
+                AuthError::InitiationFailed(format!(
+                    "Device authorization request failed: {detail}"
+                ))
             })?;
 
         Ok(AuthContextRequest::DeviceCode(DeviceCodeRequest {
@@ -571,9 +599,10 @@ impl AuthStrategy for CodexDeviceStrategy {
             })?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(AuthError::InitiationFailed(format!(
-                "Device authorization failed with status: {}",
-                response.status()
+                "Device authorization failed with status {status}: {body}"
             ))
             .into());
         }
@@ -872,9 +901,7 @@ async fn codex_poll_for_tokens(
             // Exchange the authorization code for OAuth tokens via standard
             // endpoint. Use a clean HTTP client without custom headers since the
             // standard OAuth token endpoint rejects unknown headers.
-            let clean_client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
+            let clean_client = build_http_client(None)
                 .map_err(|e| AuthError::PollFailed(format!("Failed to build HTTP client: {e}")))?;
 
             let token_response = clean_client

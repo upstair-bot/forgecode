@@ -40,13 +40,20 @@ pub(crate) fn into_domain<T: oauth2::TokenResponse>(token: T) -> OAuthTokenRespo
     }
 }
 
-/// Build HTTP client with custom headers
+/// Build HTTP client with custom headers.
+///
+/// Disables the hickory-dns resolver to use the system DNS resolver instead,
+/// which avoids spurious resolution failures observed during fresh auth flows
+/// when hickory-dns is active (upstream workaround).
 pub(crate) fn build_http_client(
     custom_headers: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         // Disable redirects to prevent SSRF vulnerabilities
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        // Use system DNS resolver; hickory-dns causes intermittent failures
+        // during OAuth device-auth initiation on fresh logins.
+        .hickory_dns(false);
 
     if let Some(headers) = custom_headers {
         let mut header_map = reqwest::header::HeaderMap::new();
@@ -276,6 +283,32 @@ mod tests {
         assert_eq!(response.refresh_token, Some("refresh_token".to_string()));
         assert_eq!(response.expires_in, Some(3600));
         assert_eq!(response.token_type, "Bearer");
+    }
+
+    #[test]
+    fn test_build_http_client_no_headers() {
+        let actual = build_http_client(None);
+        assert!(actual.is_ok());
+    }
+
+    #[test]
+    fn test_build_http_client_with_custom_headers() {
+        let fixture: HashMap<String, String> =
+            [("x-custom-header".to_string(), "test-value".to_string())]
+                .into_iter()
+                .collect();
+        let actual = build_http_client(Some(&fixture));
+        assert!(actual.is_ok());
+    }
+
+    #[test]
+    fn test_build_http_client_rejects_invalid_header_name() {
+        let fixture: HashMap<String, String> =
+            [("invalid header name!".to_string(), "value".to_string())]
+                .into_iter()
+                .collect();
+        let actual = build_http_client(Some(&fixture));
+        assert!(actual.is_err());
     }
 
     #[test]
