@@ -61,12 +61,12 @@ impl<S: Services> ForgeApp<S> {
     ) -> Result<MpscStream<Result<ChatResponse, anyhow::Error>>> {
         let services = self.services.clone();
 
-        // Get the conversation for the chat request
-        let conversation = services
-            .find_conversation(&chat.conversation_id)
-            .await
-            .unwrap_or_default()
-            .expect("conversation for the request should've been created at this point.");
+        // Get the conversation for the chat request, creating a fresh one when
+        // not found so the caller does not need to pre-create it.
+        let conversation = resolve_conversation(
+            services.find_conversation(&chat.conversation_id).await,
+            chat.conversation_id,
+        )?;
 
         // Discover files using the discovery service
         let forge_config = services.get_config();
@@ -314,5 +314,66 @@ impl<S: Services> ForgeApp<S> {
             .collect();
 
         Ok(results)
+    }
+}
+
+/// Returns the existing conversation when found, or creates a fresh one with
+/// the supplied `id` when the lookup yields `None`.
+///
+/// Any I/O error from the lookup is propagated unchanged.
+fn resolve_conversation(
+    result: anyhow::Result<Option<Conversation>>,
+    id: ConversationId,
+) -> Result<Conversation> {
+    Ok(result?.unwrap_or_else(|| Conversation::new(id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    // ---------------------------------------------------------------------------
+    // resolve_conversation
+    // ---------------------------------------------------------------------------
+
+    /// When a conversation already exists, `resolve_conversation` returns it
+    /// unchanged.
+    #[test]
+    fn test_resolve_conversation_returns_existing() {
+        let existing = Conversation::generate();
+        let id = existing.id;
+        let fixture = Ok(Some(existing.clone()));
+
+        let actual = resolve_conversation(fixture, id).unwrap();
+
+        assert_eq!(actual.id, existing.id);
+    }
+
+    /// When the lookup returns `None` (conversation not pre-created), a new
+    /// conversation is synthesised with the requested ID – no panic.
+    #[test]
+    fn test_resolve_conversation_creates_on_missing() {
+        let id = ConversationId::generate();
+        let fixture: anyhow::Result<Option<Conversation>> = Ok(None);
+
+        let actual = resolve_conversation(fixture, id).unwrap();
+
+        assert_eq!(actual.id, id);
+        assert!(actual.context.is_none());
+        assert!(actual.title.is_none());
+    }
+
+    /// I/O errors are propagated rather than swallowed.
+    #[test]
+    fn test_resolve_conversation_propagates_error() {
+        let id = ConversationId::generate();
+        let fixture: anyhow::Result<Option<Conversation>> =
+            Err(anyhow::anyhow!("storage unavailable"));
+
+        let actual = resolve_conversation(fixture, id);
+
+        assert!(actual.is_err());
     }
 }
